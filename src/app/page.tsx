@@ -3,17 +3,41 @@
 import { useState, useEffect, useCallback } from "react";
 import { BrowserProvider, Contract } from "ethers";
 import { useFhevm } from "@/hooks/useFhevm";
+import { useCoFHE } from "@/hooks/useCoFHE";
 import { SwipeCard } from "@/components/SwipeCard";
+import { SwipeCardCoFHE } from "@/components/SwipeCardCoFHE";
 import { MatchReveal } from "@/components/MatchReveal";
-import { ProfileSetup, getProfile, hasProfile, getProfiles } from "@/components/ProfileSetup";
+import { MatchRevealCoFHE } from "@/components/MatchRevealCoFHE";
+import { ProfileSetup, getProfile, hasProfile } from "@/components/ProfileSetup";
 import { MyPage } from "@/components/MyPage";
 import { UserProfile, getAllProfiles } from "@/lib/supabase";
 import TrustlessLoveABI from "@/abi/TrustlessLove.json";
+import TrustlessLoveCoFHEABI from "@/abi/TrustlessLoveCoFHE.json";
 
-// Sepolia Testnet (fhEVM v0.9 - User Decrypt Model)
-const CONTRACT_ADDRESS = "0xD94F9de87176bd92717B633095123690e8cDD0a8";
+// Network configurations
+type NetworkType = "zama" | "cofhe";
 
-// デフォルトプロフィール生成（Supabaseにない場合）
+const NETWORKS = {
+  zama: {
+    name: "Zama fhEVM",
+    chainId: "0xaa36a7", // 11155111 (Sepolia)
+    chainIdNum: 11155111,
+    contractAddress: "0xD94F9de87176bd92717B633095123690e8cDD0a8",
+    rpcUrl: "https://rpc.sepolia.org",
+    blockExplorer: "https://sepolia.etherscan.io",
+    color: "pink",
+  },
+  cofhe: {
+    name: "Fhenix CoFHE",
+    chainId: "0xaa36a7", // 11155111 (Sepolia)
+    chainIdNum: 11155111,
+    contractAddress: "0xed7840d021803D0c4A89D3184B610E8466F1eF26",
+    rpcUrl: "https://rpc.sepolia.org",
+    blockExplorer: "https://sepolia.etherscan.io",
+    color: "cyan",
+  },
+};
+
 const generateDefaultProfile = (address: string) => ({
   name: `User`,
   bio: "",
@@ -22,7 +46,17 @@ const generateDefaultProfile = (address: string) => ({
 });
 
 export default function Home() {
-  const { instance: fhevm, isInitialized } = useFhevm();
+  // Network selection
+  const [selectedNetwork, setSelectedNetwork] = useState<NetworkType>("zama");
+  const networkConfig = NETWORKS[selectedNetwork];
+
+  // Zama fhEVM hook
+  const { instance: fhevm, isInitialized: zamaInitialized } = useFhevm();
+
+  // CoFHE hook
+  const { cofhe, isInitialized: cofheInitialized, error: cofheError, initialize: initCoFHE } = useCoFHE();
+
+  // Common state
   const [contract, setContract] = useState<Contract | null>(null);
   const [userAddress, setUserAddress] = useState("");
   const [isRegistered, setIsRegistered] = useState(false);
@@ -30,18 +64,18 @@ export default function Home() {
   const [hasUserProfile, setHasUserProfile] = useState(false);
   const [editingProfile, setEditingProfile] = useState(false);
   const [showMyPage, setShowMyPage] = useState(false);
+  const [provider, setProvider] = useState<BrowserProvider | null>(null);
 
-  // ユーザーリストとスワイプ
+  // User list and swiping
   const [registeredUsers, setRegisteredUsers] = useState<string[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [loadingUsers, setLoadingUsers] = useState(false);
   const [votedUsers, setVotedUsers] = useState<Set<string>>(new Set());
 
-  // マッチ確認用
-  const [checkingMatch, setCheckingMatch] = useState<string | null>(null);
+  // Match checking
   const [matchResult, setMatchResult] = useState<{address: string, bothVoted: boolean} | null>(null);
 
-  // プロフィールキャッシュ
+  // Profile cache
   const [profileCache, setProfileCache] = useState<Map<string, UserProfile>>(new Map());
   const [myProfile, setMyProfile] = useState<{name: string, bio: string, address: string, image: string, telegramId?: string, twitterId?: string} | null>(null);
 
@@ -59,7 +93,10 @@ export default function Home() {
     return generateDefaultProfile(currentTarget);
   })() : null;
 
-  // プロフィール存在チェック（非同期）
+  // Check if FHE is initialized based on network
+  const isFheInitialized = selectedNetwork === "zama" ? zamaInitialized : cofheInitialized;
+
+  // Profile check
   useEffect(() => {
     const checkProfile = async () => {
       if (userAddress) {
@@ -83,29 +120,32 @@ export default function Home() {
     checkProfile();
   }, [userAddress]);
 
-  // 登録済みユーザーをSupabaseから取得 (Hybrid Architecture)
+  // Load registered users from Supabase
   const loadRegisteredUsers = useCallback(async () => {
     if (!contract || !userAddress) return;
     setLoadingUsers(true);
     try {
-      // Supabaseから自分以外の全プロフィールを取得
       const allProfiles = await getAllProfiles(userAddress);
       console.log(`Found ${allProfiles.length} profiles in Supabase`);
 
-      // プロフィールキャッシュを構築
       const cache = new Map<string, UserProfile>();
       allProfiles.forEach((p) => {
         cache.set(p.wallet_address.toLowerCase(), p);
       });
       setProfileCache(cache);
 
-      // アドレスリストを取得
       const allAddresses = allProfiles.map((p) => p.wallet_address);
 
-      // 既に投票済みのユーザーを除外 (ブロックチェーンで確認)
       const unvotedUsers: string[] = [];
       for (const addr of allAddresses) {
         try {
+          // Check if target user is registered on current contract
+          const targetRegistered = await contract.registered(addr);
+          if (!targetRegistered) {
+            console.log(`User ${addr} not registered on this contract, skipping`);
+            continue;
+          }
+
           const voted = await contract.hasVoted(userAddress, addr);
           if (!voted) {
             unvotedUsers.push(addr);
@@ -113,8 +153,7 @@ export default function Home() {
             setVotedUsers((prev) => new Set([...prev, addr]));
           }
         } catch (e) {
-          // コントラクトに登録されていない場合はスキップ
-          console.log(`User ${addr} not registered on-chain, skipping`);
+          console.log(`Error checking user ${addr}:`, e);
         }
       }
 
@@ -127,7 +166,7 @@ export default function Home() {
     }
   }, [contract, userAddress]);
 
-  // 登録状態チェック
+  // Check registration status
   useEffect(() => {
     const checkStatus = async () => {
       if (!contract || !userAddress) return;
@@ -144,36 +183,32 @@ export default function Home() {
     checkStatus();
   }, [contract, userAddress, loadRegisteredUsers]);
 
-  // Sepolia chain ID
-  const SEPOLIA_CHAIN_ID = "0xaa36a7"; // 11155111 in hex
-
-  // ウォレット接続
+  // Connect wallet
   const connectWallet = async () => {
     if (!window.ethereum) {
       alert("MetaMask is required");
       return;
     }
 
-    // Check and switch to Sepolia
+    // Check and switch to correct network
     try {
       const currentChainId = await window.ethereum.request({ method: "eth_chainId" });
-      if (currentChainId !== SEPOLIA_CHAIN_ID) {
+      if (currentChainId !== networkConfig.chainId) {
         try {
           await window.ethereum.request({
             method: "wallet_switchEthereumChain",
-            params: [{ chainId: SEPOLIA_CHAIN_ID }],
+            params: [{ chainId: networkConfig.chainId }],
           });
         } catch (switchError: any) {
-          // If Sepolia is not added, add it
           if (switchError.code === 4902) {
             await window.ethereum.request({
               method: "wallet_addEthereumChain",
               params: [{
-                chainId: SEPOLIA_CHAIN_ID,
+                chainId: networkConfig.chainId,
                 chainName: "Sepolia Testnet",
                 nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-                rpcUrls: ["https://rpc.sepolia.org"],
-                blockExplorerUrls: ["https://sepolia.etherscan.io"],
+                rpcUrls: [networkConfig.rpcUrl],
+                blockExplorerUrls: [networkConfig.blockExplorer],
               }],
             });
           } else {
@@ -192,14 +227,50 @@ export default function Home() {
     const signer = await p.getSigner();
     const addr = await signer.getAddress();
 
+    setProvider(p);
     setUserAddress(addr);
 
-    // コントラクトインスタンス作成
-    const c = new Contract(CONTRACT_ADDRESS, TrustlessLoveABI.abi, signer);
+    // Initialize CoFHE if selected
+    if (selectedNetwork === "cofhe" && !cofheInitialized) {
+      await initCoFHE(p, signer);
+    }
+
+    // Create contract instance with appropriate ABI
+    const abi = selectedNetwork === "zama" ? TrustlessLoveABI.abi : TrustlessLoveCoFHEABI.abi;
+    const c = new Contract(networkConfig.contractAddress, abi, signer);
     setContract(c);
   };
 
-  // ユーザー登録
+  // Handle network switch
+  const handleNetworkSwitch = async (network: NetworkType) => {
+    if (network === selectedNetwork) return;
+
+    // Reset state when switching networks
+    setContract(null);
+    setIsRegistered(false);
+    setRegisteredUsers([]);
+    setVotedUsers(new Set());
+    setMatchResult(null);
+
+    setSelectedNetwork(network);
+
+    // If already connected, reconnect with new network
+    if (userAddress && provider) {
+      const signer = await provider.getSigner();
+
+      // Initialize CoFHE if switching to it
+      if (network === "cofhe" && !cofheInitialized) {
+        await initCoFHE(provider, signer);
+      }
+
+      const newConfig = NETWORKS[network];
+      const abi = network === "zama" ? TrustlessLoveABI.abi : TrustlessLoveCoFHEABI.abi;
+      const c = new Contract(newConfig.contractAddress, abi, signer);
+      setContract(c);
+    }
+  };
+
+  // Register user
   const registerUser = async () => {
     if (!contract) return;
     setRegistering(true);
@@ -215,22 +286,60 @@ export default function Home() {
     }
   };
 
+  const themeColor = networkConfig.color === "pink" ? {
+    primary: "from-pink-500 to-cyan-500",
+    button: "bg-pink-600 hover:bg-pink-700",
+    accent: "text-pink-400",
+    border: "border-pink-500",
+  } : {
+    primary: "from-cyan-500 to-blue-500",
+    button: "bg-cyan-600 hover:bg-cyan-500",
+    accent: "text-cyan-400",
+    border: "border-cyan-500",
+  };
+
   return (
     <main className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-4">
-      <h1 className="text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r from-pink-500 to-cyan-500 mb-2">
+      {/* Network Selector */}
+      <div className="fixed top-4 right-4 z-50">
+        <div className="flex gap-2 bg-slate-800/80 backdrop-blur-sm rounded-lg p-1 border border-slate-700">
+          <button
+            onClick={() => handleNetworkSwitch("zama")}
+            className={`px-3 py-1.5 rounded text-sm font-medium transition ${
+              selectedNetwork === "zama"
+                ? "bg-pink-600 text-white"
+                : "text-slate-400 hover:text-white hover:bg-slate-700"
+            }`}
+          >
+            Zama fhEVM
+          </button>
+          <button
+            onClick={() => handleNetworkSwitch("cofhe")}
+            className={`px-3 py-1.5 rounded text-sm font-medium transition ${
+              selectedNetwork === "cofhe"
+                ? "bg-cyan-600 text-white"
+                : "text-slate-400 hover:text-white hover:bg-slate-700"
+            }`}
+          >
+            Fhenix CoFHE
+          </button>
+        </div>
+      </div>
+
+      <h1 className={`text-5xl font-black text-transparent bg-clip-text bg-gradient-to-r ${themeColor.primary} mb-2`}>
         Trustless Love
       </h1>
       <p className="text-slate-400 mb-4 font-mono text-sm">
-        Zama fhEVM Powered Dating
+        {networkConfig.name} Powered Dating
       </p>
 
-      {/* 自分のプロフィール表示 */}
+      {/* Profile display */}
       {myProfile && hasUserProfile && !editingProfile && !showMyPage && (
         <div className="flex items-center gap-3 mb-6 px-4 py-2 bg-slate-800/50 rounded-full">
           <img
             src={myProfile.image}
             alt="Your avatar"
-            className="w-10 h-10 rounded-full border-2 border-pink-500 object-cover"
+            className={`w-10 h-10 rounded-full border-2 ${themeColor.border} object-cover`}
           />
           <span className="text-white font-medium">{myProfile.name}</span>
           <span className="text-slate-500 text-xs font-mono">
@@ -238,7 +347,7 @@ export default function Home() {
           </span>
           <button
             onClick={() => setEditingProfile(true)}
-            className="ml-2 p-1.5 text-slate-400 hover:text-pink-400 hover:bg-slate-700 rounded-full transition"
+            className={`ml-2 p-1.5 text-slate-400 hover:${themeColor.accent} hover:bg-slate-700 rounded-full transition`}
             title="Edit Profile"
           >
             <svg xmlns="http://www.w3.org/2000/svg" className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -260,14 +369,34 @@ export default function Home() {
       {!userAddress ? (
         <button
           onClick={connectWallet}
-          className="px-8 py-4 bg-pink-600 text-white font-bold rounded-lg hover:bg-pink-700 transition"
+          className={`px-8 py-4 ${themeColor.button} text-white font-bold rounded-lg transition`}
         >
           Connect Wallet to Start
         </button>
       ) : (
         <div className="flex flex-col items-center w-full max-w-md">
-          {!isInitialized ? (
-            <p className="text-cyan-400">Initializing FHE environment...</p>
+          {!isFheInitialized ? (
+            <div className="text-center">
+              {selectedNetwork === "cofhe" && cofheError ? (
+                <div className="text-center">
+                  <p className="text-red-400 mb-4">CoFHE initialization failed:</p>
+                  <p className="text-red-300 text-sm mb-4">{cofheError}</p>
+                  <button
+                    onClick={async () => {
+                      if (provider) {
+                        const signer = await provider.getSigner();
+                        await initCoFHE(provider, signer);
+                      }
+                    }}
+                    className="px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded"
+                  >
+                    Retry Initialization
+                  </button>
+                </div>
+              ) : (
+                <p className={themeColor.accent}>Initializing FHE environment...</p>
+              )}
+            </div>
           ) : !isRegistered ? (
             <div className="text-center">
               <p className="text-slate-300 mb-4">
@@ -276,7 +405,7 @@ export default function Home() {
               <button
                 onClick={registerUser}
                 disabled={registering}
-                className="px-8 py-4 bg-cyan-600 text-white font-bold rounded-lg hover:bg-cyan-500 transition disabled:opacity-50"
+                className={`px-8 py-4 ${themeColor.button} text-white font-bold rounded-lg transition disabled:opacity-50`}
               >
                 {registering ? "Registering..." : "Register Now"}
               </button>
@@ -330,11 +459,11 @@ export default function Home() {
               onBack={() => setShowMyPage(false)}
             />
           ) : loadingUsers ? (
-            <p className="text-cyan-400 animate-pulse">Loading users...</p>
+            <p className={`${themeColor.accent} animate-pulse`}>Loading users...</p>
           ) : matchResult ? (
             <div className="w-full max-w-md">
-              <div className="text-center mb-6 p-4 bg-cyan-500/20 border border-cyan-500 rounded-lg">
-                <p className="text-cyan-400 text-lg font-bold">🔐 Both parties have voted!</p>
+              <div className={`text-center mb-6 p-4 bg-${networkConfig.color}-500/20 border ${themeColor.border} rounded-lg`}>
+                <p className={themeColor.accent + " text-lg font-bold"}>Both parties have voted!</p>
                 <p className="text-slate-400 text-sm mt-1">
                   With: {matchResult.address.slice(0, 10)}...
                 </p>
@@ -342,12 +471,21 @@ export default function Home() {
                   Votes are encrypted. Reveal to see if it&apos;s a match!
                 </p>
               </div>
-              <MatchReveal
-                fhevm={fhevm}
-                contract={contract!}
-                userAddress={userAddress}
-                targetAddress={matchResult.address}
-              />
+              {selectedNetwork === "zama" ? (
+                <MatchReveal
+                  fhevm={fhevm}
+                  contract={contract!}
+                  userAddress={userAddress}
+                  targetAddress={matchResult.address}
+                />
+              ) : (
+                <MatchRevealCoFHE
+                  cofhe={cofhe}
+                  contract={contract!}
+                  userAddress={userAddress}
+                  targetAddress={matchResult.address}
+                />
+              )}
               <button
                 onClick={() => setMatchResult(null)}
                 className="w-full mt-4 px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded"
@@ -363,14 +501,14 @@ export default function Home() {
               </p>
               <button
                 onClick={loadRegisteredUsers}
-                className="mt-4 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white rounded"
+                className={`mt-4 px-4 py-2 ${themeColor.button} text-white rounded`}
               >
                 Refresh Users
               </button>
             </div>
           ) : targetProfile ? (
             <>
-              {contract && fhevm && (
+              {contract && (selectedNetwork === "zama" ? fhevm : cofhe) && (
                 <>
                   <div className="mb-2 text-center">
                     <p className="text-slate-500 text-sm">
@@ -378,27 +516,45 @@ export default function Home() {
                     </p>
                   </div>
 
-                  <SwipeCard
-                    fhevm={fhevm}
-                    contract={contract}
-                    userAddress={userAddress}
-                    targetProfile={targetProfile}
-                    onVoted={() => {
-                      // 次のユーザーへ
-                      setVotedUsers(prev => new Set([...prev, currentTarget]));
-                      if (currentIndex < registeredUsers.length - 1) {
-                        setCurrentIndex(currentIndex + 1);
-                      } else {
-                        // 全員スワイプ済み
-                        setRegisteredUsers([]);
-                      }
-                    }}
-                    onMatch={(targetAddress) => {
-                      // マッチ！MatchReveal画面へ
-                      setVotedUsers(prev => new Set([...prev, currentTarget]));
-                      setMatchResult({ address: targetAddress, bothVoted: true });
-                    }}
-                  />
+                  {selectedNetwork === "zama" ? (
+                    <SwipeCard
+                      fhevm={fhevm}
+                      contract={contract}
+                      userAddress={userAddress}
+                      targetProfile={targetProfile}
+                      onVoted={() => {
+                        setVotedUsers(prev => new Set([...prev, currentTarget]));
+                        if (currentIndex < registeredUsers.length - 1) {
+                          setCurrentIndex(currentIndex + 1);
+                        } else {
+                          setRegisteredUsers([]);
+                        }
+                      }}
+                      onMatch={(targetAddress) => {
+                        setVotedUsers(prev => new Set([...prev, currentTarget]));
+                        setMatchResult({ address: targetAddress, bothVoted: true });
+                      }}
+                    />
+                  ) : (
+                    <SwipeCardCoFHE
+                      cofhe={cofhe}
+                      contract={contract}
+                      userAddress={userAddress}
+                      targetProfile={targetProfile}
+                      onVoted={() => {
+                        setVotedUsers(prev => new Set([...prev, currentTarget]));
+                        if (currentIndex < registeredUsers.length - 1) {
+                          setCurrentIndex(currentIndex + 1);
+                        } else {
+                          setRegisteredUsers([]);
+                        }
+                      }}
+                      onMatch={(targetAddress) => {
+                        setVotedUsers(prev => new Set([...prev, currentTarget]));
+                        setMatchResult({ address: targetAddress, bothVoted: true });
+                      }}
+                    />
+                  )}
                 </>
               )}
             </>

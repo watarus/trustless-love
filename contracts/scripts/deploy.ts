@@ -1,7 +1,7 @@
 import { ethers } from "hardhat";
 
 async function main() {
-  console.log("Deploying TrustlessLove contract...");
+  console.log("Deploying TrustlessLove (Zama fhEVM) contract...");
 
   const [deployer] = await ethers.getSigners();
   console.log("Deploying with account:", deployer.address);

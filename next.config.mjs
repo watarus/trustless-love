@@ -1,9 +1,3 @@
-import { fileURLToPath } from "url";
-import { dirname, join } from "path";
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   webpack: (config, { isServer }) => {
@@ -12,14 +6,15 @@ const nextConfig = {
       ...config.experiments,
       asyncWebAssembly: true,
       layers: true,
+      topLevelAwait: true,
     };
 
-    // Configure how WASM modules are resolved
-    // The WASM file is manually copied to public/tfhe_bg.wasm
-    config.resolve.alias = {
-      ...config.resolve.alias,
-      "tfhe_bg.wasm": join(__dirname, "public/tfhe_bg.wasm"),
-    };
+    // Set output for WASM files
+    if (isServer) {
+      config.output.webassemblyModuleFilename = "./../static/wasm/[modulehash].wasm";
+    } else {
+      config.output.webassemblyModuleFilename = "static/wasm/[modulehash].wasm";
+    }
 
     // Fallback for client-side polyfills
     if (!isServer) {
@@ -31,7 +26,6 @@ const nextConfig = {
         fs: false,
         path: false,
       };
-
     }
 
     return config;
