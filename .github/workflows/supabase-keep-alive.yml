@@ -1,0 +1,37 @@
+name: Supabase Keep Alive
+
+# GitHub Secretsの設定が必要です:
+# Settings → Secrets and variables → Actions で以下を追加:
+# - SUPABASE_URL: SupabaseプロジェクトのURL (例: https://xxxxx.supabase.co)
+# - SUPABASE_ANON_KEY: Supabaseの匿名キー (Settings → API → anon/public key)
+
+on:
+  schedule:
+    - cron: '0 0 */2 * *' # 2日おきに実行
+  workflow_dispatch: # 手動実行用
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Keep Supabase DB Alive
+        run: |
+          # profilesテーブルに軽いクエリを実行してDB接続を維持
+          response=$(curl -s -w "\n%{http_code}" -X GET "${{ secrets.SUPABASE_URL }}/rest/v1/profiles?select=wallet_address&limit=1" \
+            -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+            -H "Prefer: return=minimal")
+          
+          http_code=$(echo "$response" | tail -n1)
+          
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "✅ Supabase DB is alive (HTTP $http_code)"
+            exit 0
+          else
+            echo "❌ Supabase DB health check failed (HTTP $http_code)"
+            # エラーレスポンスの最初の100文字のみ表示（Secrets漏洩防止）
+            error_body=$(echo "$response" | head -n -1 | head -c 100)
+            echo "Error preview: $error_body..."
+            exit 1
+          fi
+
